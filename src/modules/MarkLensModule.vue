@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { invoke } from "@tauri-apps/api/core";
+import { Menu } from "@tauri-apps/api/menu";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import DOMPurify from "dompurify";
 import { marked, type Token } from "marked";
@@ -26,8 +29,29 @@ interface OutlineItem {
   prefix: string;
 }
 
+interface MarkLensTab {
+  id: string;
+  fileName: string;
+  content: string;
+  savedPath: string | null;
+  lastSavedContent: string;
+}
+
+interface MarkdownFilePayload {
+  file_name: string;
+  path: string;
+  content: string;
+}
+
+interface SavedMarkdownFile {
+  file_name: string;
+  path: string;
+}
+
 const storageKey = "marklens-draft";
 const fileNameKey = "marklens-file-name";
+const tabsKey = "marklens-tabs";
+const activeTabKey = "marklens-active-tab";
 const themeKey = "marklens-theme";
 const previewOnlyKey = "marklens-preview-only";
 const splitRatioKey = "marklens-split-ratio";
@@ -42,11 +66,12 @@ marked.setOptions({
 
 const fileInput = ref<HTMLInputElement | null>(null);
 const editor = ref<HTMLTextAreaElement | null>(null);
+const tabList = ref<HTMLElement | null>(null);
 const workspace = ref<HTMLElement | null>(null);
 const previewScroll = ref<HTMLElement | null>(null);
 const previewArticle = ref<HTMLElement | null>(null);
-const content = ref("");
-const fileName = ref("Untitled.md");
+const tabs = ref<MarkLensTab[]>([createTab()]);
+const activeTabId = ref(tabs.value[0].id);
 const theme = ref<ThemeMode>("light");
 const previewOnly = ref(false);
 const dragActive = ref(false);
@@ -55,11 +80,74 @@ const activeOutlineId = ref("");
 const outlineOpen = ref(true);
 const splitRatio = ref(0.5);
 const resizing = ref(false);
+const fullscreenPreview = ref(false);
+const pendingCloseTabId = ref<string | null>(null);
+const pendingCloseQueue = ref<string[]>([]);
+const renamingTabId = ref<string | null>(null);
+const renameDraft = ref("");
 
 let dragDepth = 0;
 let noticeTimer: number | undefined;
 let ignoreEditorScroll = false;
 let ignorePreviewScroll = false;
+
+function nextTabId() {
+  return `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createTab(partial: Partial<MarkLensTab> = {}): MarkLensTab {
+  return {
+    id: partial.id ?? nextTabId(),
+    fileName: partial.fileName ?? "Untitled.md",
+    content: partial.content ?? "",
+    savedPath: partial.savedPath ?? null,
+    lastSavedContent: partial.lastSavedContent ?? partial.content ?? "",
+  };
+}
+
+function isInitialBlankTab() {
+  return (
+    tabs.value.length === 1
+    && tabs.value[0]?.fileName === "Untitled.md"
+    && !tabs.value[0]?.content
+    && !tabs.value[0]?.savedPath
+  );
+}
+
+function isTabDirty(tab: MarkLensTab) {
+  return tab.content !== tab.lastSavedContent;
+}
+
+function nextUntitledName() {
+  const used = new Set(tabs.value.map((tab) => tab.fileName));
+  if (!used.has("Untitled.md")) {
+    return "Untitled.md";
+  }
+
+  let index = 2;
+  while (used.has(`Untitled-${index}.md`)) {
+    index += 1;
+  }
+
+  return `Untitled-${index}.md`;
+}
+
+const activeTab = computed(() =>
+  tabs.value.find((tab) => tab.id === activeTabId.value) ?? tabs.value[0] ?? null,
+);
+
+const pendingCloseTab = computed(() =>
+  tabs.value.find((tab) => tab.id === pendingCloseTabId.value) ?? null,
+);
+
+const content = computed({
+  get: () => activeTab.value?.content ?? "",
+  set: (value: string) => {
+    if (activeTab.value) {
+      activeTab.value.content = value;
+    }
+  },
+});
 
 function collectOutlineItems(tokens: Token[]) {
   const items: OutlineItem[] = [];
@@ -143,21 +231,325 @@ function flash(message: string) {
   }, 1400);
 }
 
-async function loadMarkdownFile(file: File) {
-  const text = await file.text();
-  content.value = text;
-  fileName.value = file.name;
-  flash(`loaded ${file.name}`);
+function ensureActiveTabVisible() {
+  void nextTick(() => {
+    tabList.value
+      ?.querySelector<HTMLElement>(`[data-tab-id="${activeTabId.value}"]`)
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
 }
 
-function openPicker() {
-  fileInput.value?.click();
+function activateTab(id: string) {
+  activeTabId.value = id;
+  ensureActiveTabVisible();
+}
+
+function createEmptyTab() {
+  const nextTab = createTab({ fileName: nextUntitledName() });
+  tabs.value.push(nextTab);
+  activeTabId.value = nextTab.id;
+  flash("new tab");
+  ensureActiveTabVisible();
+}
+
+function toggleFullscreenPreview() {
+  fullscreenPreview.value = !fullscreenPreview.value;
+}
+
+function queueCloseTabs(tabIds: string[]) {
+  const uniqueIds = Array.from(new Set(tabIds));
+  if (!uniqueIds.length) {
+    return;
+  }
+
+  pendingCloseQueue.value = uniqueIds;
+  continueClosingTabs();
+}
+
+function continueClosingTabs() {
+  while (pendingCloseQueue.value.length) {
+    const nextId = pendingCloseQueue.value.shift();
+    if (!nextId) {
+      continue;
+    }
+
+    const tab = tabs.value.find((item) => item.id === nextId);
+    if (!tab) {
+      continue;
+    }
+
+    if (isTabDirty(tab)) {
+      pendingCloseTabId.value = nextId;
+      return;
+    }
+
+    finishCloseTab(nextId);
+  }
+}
+
+async function onTabContextMenu(tab: MarkLensTab, event: MouseEvent) {
+  event.preventDefault();
+  activateTab(tab.id);
+  renamingTabId.value = null;
+
+  const index = tabs.value.findIndex((item) => item.id === tab.id);
+  const menu = await Menu.new({
+    items: [
+      {
+        text: "Close Others",
+        enabled: tabs.value.length > 1,
+        action: () => {
+          closeOtherTabs(tab.id);
+        },
+      },
+      {
+        text: "Close Left",
+        enabled: index > 0,
+        action: () => {
+          closeTabsToLeft(tab.id);
+        },
+      },
+      {
+        text: "Close Right",
+        enabled: index >= 0 && index < tabs.value.length - 1,
+        action: () => {
+          closeTabsToRight(tab.id);
+        },
+      },
+      {
+        item: "Separator",
+      },
+      {
+        text: "Copy",
+        action: () => {
+          duplicateTab(tab.id);
+        },
+      },
+      {
+        text: "Delete",
+        action: () => {
+          closeTab(tab.id);
+        },
+      },
+      {
+        text: "Rename",
+        action: () => {
+          requestRenameTab(tab.id);
+        },
+      },
+    ],
+  });
+
+  try {
+    await menu.popup(undefined, getCurrentWindow());
+  } finally {
+    await menu.close();
+  }
+}
+
+function duplicateTab(tabId: string) {
+  const tab = tabs.value.find((item) => item.id === tabId);
+  if (!tab) {
+    return;
+  }
+
+  const duplicate = createTab({
+    fileName: tab.fileName,
+    content: tab.content,
+    savedPath: null,
+    lastSavedContent: tab.content,
+  });
+  tabs.value.push(duplicate);
+  activeTabId.value = duplicate.id;
+  flash(`copied ${tab.fileName}`);
+  ensureActiveTabVisible();
+}
+
+function closeOtherTabs(tabId: string) {
+  queueCloseTabs(tabs.value.filter((tab) => tab.id !== tabId).map((tab) => tab.id));
+}
+
+function closeTabsToLeft(tabId: string) {
+  const index = tabs.value.findIndex((tab) => tab.id === tabId);
+  if (index <= 0) {
+    return;
+  }
+
+  queueCloseTabs(tabs.value.slice(0, index).map((tab) => tab.id));
+}
+
+function closeTabsToRight(tabId: string) {
+  const index = tabs.value.findIndex((tab) => tab.id === tabId);
+  if (index < 0 || index >= tabs.value.length - 1) {
+    return;
+  }
+
+  queueCloseTabs(tabs.value.slice(index + 1).map((tab) => tab.id));
+}
+
+function requestRenameTab(tabId: string) {
+  const tab = tabs.value.find((item) => item.id === tabId);
+  if (!tab) {
+    return;
+  }
+
+  renamingTabId.value = tab.id;
+  renameDraft.value = tab.fileName;
+  void nextTick(() => {
+    document.querySelector<HTMLInputElement>(`[data-rename-input="${tab.id}"]`)?.focus();
+    document.querySelector<HTMLInputElement>(`[data-rename-input="${tab.id}"]`)?.select();
+  });
+}
+
+async function commitRenameTab(tabId: string) {
+  const tab = tabs.value.find((item) => item.id === tabId);
+  const trimmed = renameDraft.value.trim();
+  if (!tab) {
+    renamingTabId.value = null;
+    renameDraft.value = "";
+    return;
+  }
+
+  if (trimmed && trimmed !== tab.fileName) {
+    if (tab.savedPath) {
+      try {
+        const renamed = await invoke<SavedMarkdownFile>("rename_markdown_file", {
+          existingPath: tab.savedPath,
+          nextFileName: trimmed,
+        });
+        tab.fileName = renamed.file_name;
+        tab.savedPath = renamed.path;
+        flash(`renamed to ${renamed.file_name}`);
+      } catch {
+        flash("rename failed");
+        renamingTabId.value = null;
+        renameDraft.value = "";
+        return;
+      }
+    } else {
+      tab.fileName = trimmed;
+      flash(`renamed to ${trimmed}`);
+    }
+  }
+
+  renamingTabId.value = null;
+  renameDraft.value = "";
+}
+
+function cancelRenameTab() {
+  renamingTabId.value = null;
+  renameDraft.value = "";
+}
+
+function onRenameKeydown(tabId: string, event: KeyboardEvent) {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void commitRenameTab(tabId);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    cancelRenameTab();
+  }
+}
+
+function finishCloseTab(id: string) {
+  const index = tabs.value.findIndex((tab) => tab.id === id);
+  if (index < 0) {
+    return;
+  }
+
+  const wasActive = activeTabId.value === id;
+  tabs.value.splice(index, 1);
+
+  if (!tabs.value.length) {
+    const nextTab = createTab();
+    tabs.value = [nextTab];
+    activeTabId.value = nextTab.id;
+    return;
+  }
+
+  if (wasActive) {
+    activeTabId.value = tabs.value[Math.max(0, index - 1)]?.id ?? tabs.value[0].id;
+  }
+
+  ensureActiveTabVisible();
+}
+
+function closeTab(id: string) {
+  queueCloseTabs([id]);
+}
+
+function mergeTabs(nextTabs: MarkLensTab[]) {
+  if (!nextTabs.length) {
+    return;
+  }
+
+  const existing = isInitialBlankTab() ? [] : [...tabs.value];
+  let lastActiveId = nextTabs[nextTabs.length - 1].id;
+
+  nextTabs.forEach((nextTab) => {
+    const duplicate = nextTab.savedPath
+      ? existing.find((tab) => tab.savedPath === nextTab.savedPath)
+      : null;
+
+    if (duplicate) {
+      duplicate.content = nextTab.content;
+      duplicate.fileName = nextTab.fileName;
+      duplicate.lastSavedContent = nextTab.lastSavedContent;
+      lastActiveId = duplicate.id;
+      return;
+    }
+
+    existing.push(nextTab);
+    lastActiveId = nextTab.id;
+  });
+
+  tabs.value = existing.length ? existing : [createTab()];
+  activeTabId.value = lastActiveId;
+  ensureActiveTabVisible();
+}
+
+async function loadMarkdownFiles(files: File[]) {
+  if (!files.length) {
+    return;
+  }
+
+  const openedTabs = await Promise.all(files.map(async (file) => createTab({
+    fileName: file.name,
+    content: await file.text(),
+    lastSavedContent: await file.text(),
+  })));
+  mergeTabs(openedTabs);
+  flash(`opened ${openedTabs.length} file${openedTabs.length === 1 ? "" : "s"}`);
+}
+
+async function openPicker() {
+  try {
+    const payload = await invoke<MarkdownFilePayload[]>("open_markdown_files");
+    const openedTabs = payload.map((item) => createTab({
+      fileName: item.file_name,
+      content: item.content,
+      savedPath: item.path,
+      lastSavedContent: item.content,
+    }));
+    mergeTabs(openedTabs);
+    if (openedTabs.length) {
+      flash(`opened ${openedTabs.length} file${openedTabs.length === 1 ? "" : "s"}`);
+    }
+    return;
+  } catch {
+    fileInput.value?.click();
+  }
 }
 
 function clearDraft() {
-  content.value = "";
-  fileName.value = "Untitled.md";
-  flash("draft cleared");
+  if (!activeTab.value) {
+    return;
+  }
+
+  activeTab.value.content = "";
+  activeTab.value.fileName = "Untitled.md";
+  activeTab.value.savedPath = null;
+  flash("tab cleared");
 }
 
 function togglePreviewOnly() {
@@ -412,11 +804,96 @@ async function copyHtml() {
   flash("rendered html copied");
 }
 
+async function saveTab(tab: MarkLensTab) {
+  try {
+    const saved = await invoke<SavedMarkdownFile>("save_markdown_file", {
+      existingPath: tab.savedPath,
+      suggestedName: tab.fileName,
+      content: tab.content,
+    });
+    tab.fileName = saved.file_name;
+    tab.savedPath = saved.path;
+    tab.lastSavedContent = tab.content;
+    flash(`saved ${saved.file_name}`);
+    return true;
+  } catch (error) {
+    if (String(error).includes("save canceled")) {
+      flash("save canceled");
+      return false;
+    }
+
+    if (activeTab.value?.id !== tab.id) {
+      activeTabId.value = tab.id;
+    }
+
+    downloadCurrentTab();
+    tab.lastSavedContent = tab.content;
+    flash(`downloaded ${tab.fileName}`);
+    return true;
+  }
+}
+
+function downloadCurrentTab() {
+  if (!activeTab.value) {
+    return;
+  }
+
+  const blob = new Blob([activeTab.value.content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = activeTab.value.fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+async function saveCurrentTab() {
+  if (!activeTab.value) {
+    return;
+  }
+
+  await saveTab(activeTab.value);
+}
+
+function cancelPendingClose() {
+  pendingCloseTabId.value = null;
+  pendingCloseQueue.value = [];
+  flash("close canceled");
+}
+
+function discardPendingClose() {
+  if (!pendingCloseTabId.value) {
+    return;
+  }
+
+  const tabId = pendingCloseTabId.value;
+  pendingCloseTabId.value = null;
+  finishCloseTab(tabId);
+  continueClosingTabs();
+}
+
+async function saveAndClosePendingTab() {
+  const tab = pendingCloseTab.value;
+  if (!tab) {
+    return;
+  }
+
+  const saved = await saveTab(tab);
+  if (!saved) {
+    return;
+  }
+
+  const tabId = tab.id;
+  pendingCloseTabId.value = null;
+  finishCloseTab(tabId);
+  continueClosingTabs();
+}
+
 function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (file) {
-    void loadMarkdownFile(file);
+  const files = Array.from(input.files ?? []);
+  if (files.length) {
+    void loadMarkdownFiles(files);
   }
   input.value = "";
 }
@@ -436,20 +913,42 @@ function onDragLeave() {
 function onDrop(event: DragEvent) {
   dragDepth = 0;
   dragActive.value = false;
-  const file = event.dataTransfer?.files?.[0];
-  if (file) {
-    void loadMarkdownFile(file);
+  const files = Array.from(event.dataTransfer?.files ?? []);
+  if (files.length) {
+    void loadMarkdownFiles(files);
   }
 }
 
 function onWindowKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape" && fullscreenPreview.value) {
+    event.preventDefault();
+    fullscreenPreview.value = false;
+    return;
+  }
+
+  if (event.key === "Escape" && pendingCloseTabId.value) {
+    event.preventDefault();
+    cancelPendingClose();
+    return;
+  }
+
+  if (event.key === "Escape" && renamingTabId.value) {
+    event.preventDefault();
+    cancelRenameTab();
+    return;
+  }
+
   const mod = event.metaKey || event.ctrlKey;
   if (!mod) return;
 
   switch (event.key.toLowerCase()) {
     case "o":
       event.preventDefault();
-      openPicker();
+      void openPicker();
+      break;
+    case "s":
+      event.preventDefault();
+      void saveCurrentTab();
       break;
     case "k":
       event.preventDefault();
@@ -460,12 +959,13 @@ function onWindowKeydown(event: KeyboardEvent) {
   }
 }
 
-watch(content, (value) => {
-  localStorage.setItem(storageKey, value);
-});
+watch(tabs, (value) => {
+  localStorage.setItem(tabsKey, JSON.stringify(value));
+}, { deep: true });
 
-watch(fileName, (value) => {
-  localStorage.setItem(fileNameKey, value);
+watch(activeTabId, (value) => {
+  localStorage.setItem(activeTabKey, value);
+  ensureActiveTabVisible();
 });
 
 watch(theme, (value) => {
@@ -510,18 +1010,51 @@ watch(rendered, () => {
 }, { flush: "post" });
 
 onMounted(() => {
+  const savedTabs = localStorage.getItem(tabsKey);
+  const savedActiveTab = localStorage.getItem(activeTabKey);
   const savedContent = localStorage.getItem(storageKey);
   const savedName = localStorage.getItem(fileNameKey);
   const savedTheme = localStorage.getItem(themeKey);
   const savedPreviewOnly = localStorage.getItem(previewOnlyKey);
   const savedSplitRatio = localStorage.getItem(splitRatioKey);
 
-  if (savedContent !== null) {
-    content.value = savedContent;
+  if (savedTabs) {
+    try {
+      const parsed = JSON.parse(savedTabs);
+      if (Array.isArray(parsed)) {
+        const restoredTabs = parsed
+          .filter((item) => item && typeof item.fileName === "string" && typeof item.content === "string")
+          .map((item) => createTab({
+            id: typeof item.id === "string" ? item.id : undefined,
+            fileName: item.fileName,
+            content: item.content,
+            savedPath: typeof item.savedPath === "string" ? item.savedPath : null,
+            lastSavedContent: typeof item.lastSavedContent === "string"
+              ? item.lastSavedContent
+              : typeof item.savedPath === "string"
+                ? item.content
+                : "",
+          }));
+
+        if (restoredTabs.length) {
+          tabs.value = restoredTabs;
+        }
+      }
+    } catch {
+      tabs.value = [createTab()];
+    }
+  } else {
+    tabs.value = [createTab({
+      fileName: savedName || "Untitled.md",
+      content: savedContent ?? "",
+      lastSavedContent: "",
+    })];
   }
 
-  if (savedName) {
-    fileName.value = savedName;
+  if (savedActiveTab && tabs.value.some((tab) => tab.id === savedActiveTab)) {
+    activeTabId.value = savedActiveTab;
+  } else {
+    activeTabId.value = tabs.value[0]?.id ?? createTab().id;
   }
 
   previewOnly.value = savedPreviewOnly === "1";
@@ -572,14 +1105,84 @@ onBeforeUnmount(() => {
     <div class="toolbar">
       <div class="filepill">
         <span class="prompt">#</span>
-        <span class="filename" :title="fileName">{{ fileName }}</span>
+        <div ref="tabList" class="filepill-tabs" role="tablist" aria-label="open markdown tabs">
+          <div
+            v-for="tab in tabs"
+            :key="tab.id"
+            class="file-tab"
+            :class="{ active: tab.id === activeTabId, dirty: isTabDirty(tab) }"
+            :data-tab-id="tab.id"
+            @contextmenu="onTabContextMenu(tab, $event)"
+          >
+            <button
+              v-if="renamingTabId !== tab.id"
+              class="file-tab-button"
+              type="button"
+              role="tab"
+              :aria-selected="tab.id === activeTabId"
+              :title="tab.savedPath ?? tab.fileName"
+              @click="activateTab(tab.id)"
+            >
+              <span class="file-tab-label">{{ tab.fileName }}</span>
+              <span v-if="isTabDirty(tab)" class="file-tab-dirty-slot" aria-hidden="true"></span>
+            </button>
+            <input
+              v-else
+              :data-rename-input="tab.id"
+              v-model="renameDraft"
+              class="file-tab-rename-input"
+              type="text"
+              spellcheck="false"
+              @blur="commitRenameTab(tab.id)"
+              @keydown="onRenameKeydown(tab.id, $event)"
+            />
+            <div class="file-tab-accessory">
+              <span v-if="isTabDirty(tab)" class="file-tab-dirty-dot" aria-hidden="true"></span>
+              <button
+                v-if="tabs.length > 1"
+                class="file-tab-close"
+                type="button"
+                :title="`close ${tab.fileName}`"
+                :aria-label="`close ${tab.fileName}`"
+                @click.stop="closeTab(tab.id)"
+              >
+                <span class="file-tab-close-glyph" aria-hidden="true">×</span>
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="toolbar-actions">
-        <button class="action icon-action accent-btn" type="button" title="open file" aria-label="open file" @click="openPicker">
+        <button class="action icon-action accent-btn" type="button" title="open files" aria-label="open files" @click="openPicker">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M4.5 6.5h4l1.4 1.8H15.5a1 1 0 0 1 1 1v4.7a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1v-6.7a1 1 0 0 1 1-1Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" />
             <path d="M10 10.2v3.4M8.3 11.9H11.7" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" />
+          </svg>
+        </button>
+        <button class="action icon-action" type="button" title="new tab" aria-label="new tab" @click="createEmptyTab">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M5.5 4.5h7.8l1.7 1.7v9.3a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" />
+            <path d="M10 8v5M7.5 10.5h5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" />
+          </svg>
+        </button>
+        <button class="action icon-action" type="button" title="save file" aria-label="save file" @click="saveCurrentTab">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M5.5 4.5h7.8l1.7 1.7v9.3a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1Z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" />
+            <path d="M7.5 4.5v4h5v-4" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" />
+            <path d="M7.5 13h5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" />
+          </svg>
+        </button>
+        <button
+          class="action icon-action"
+          :class="{ on: fullscreenPreview }"
+          type="button"
+          :title="fullscreenPreview ? 'exit fullscreen preview' : 'fullscreen preview'"
+          :aria-label="fullscreenPreview ? 'exit fullscreen preview' : 'fullscreen preview'"
+          @click="toggleFullscreenPreview"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M4.5 8V5.5h2.5M15.5 8V5.5H13M4.5 12v2.5h2.5M15.5 12v2.5H13" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" />
           </svg>
         </button>
         <button
@@ -711,13 +1314,54 @@ onBeforeUnmount(() => {
       ref="fileInput"
       class="visually-hidden"
       type="file"
+      multiple
       accept=".md,.markdown,.mdown,.mkdn,.txt,text/markdown,text/plain"
       @change="onFileChange"
     />
 
     <div v-if="dragActive" class="dropzone">
       <strong>drop markdown</strong>
-      <span>replace the current draft</span>
+      <span>open in a new tab</span>
+    </div>
+
+    <div v-if="fullscreenPreview" class="fullscreen-preview">
+      <div class="fullscreen-preview-bar">
+        <span class="fullscreen-preview-title">{{ activeTab?.fileName ?? 'Preview' }}</span>
+        <button
+          class="action icon-action"
+          type="button"
+          title="exit fullscreen preview"
+          aria-label="exit fullscreen preview"
+          @click="toggleFullscreenPreview"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M6 6l8 8M14 6l-8 8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7" />
+          </svg>
+        </button>
+      </div>
+      <div class="fullscreen-preview-scroll">
+        <article class="prose" v-html="rendered"></article>
+      </div>
+    </div>
+
+    <div v-if="pendingCloseTab" class="confirm-backdrop" @click.self="cancelPendingClose">
+      <div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="Unsaved changes">
+        <strong>Unsaved Changes</strong>
+        <p>
+          Save changes to <span class="confirm-file-name">{{ pendingCloseTab.fileName }}</span> before closing?
+        </p>
+        <div class="confirm-actions">
+          <button class="action secondary-dialog-action" type="button" @click="cancelPendingClose">
+            Cancel
+          </button>
+          <button class="action danger-dialog-action" type="button" @click="discardPendingClose">
+            Don’t Save
+          </button>
+          <button class="action accent-btn dialog-save-action" type="button" @click="saveAndClosePendingTab">
+            Save
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>

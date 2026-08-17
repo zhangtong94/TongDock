@@ -46,6 +46,7 @@ const modules: BenchModule[] = [
     component: MarkLensModule,
     shortcuts: [
       { keys: ["⌘/Ctrl", "O"], label: "open" },
+      { keys: ["⌘/Ctrl", "S"], label: "save" },
       { keys: ["⌘/Ctrl", "K"], label: "clear" },
     ],
   },

@@ -148,6 +148,21 @@ struct AppState {
     history: Mutex<History>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct MarkdownFilePayload {
+    file_name: String,
+    path: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct SavedMarkdownFile {
+    file_name: String,
+    path: String,
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -224,6 +239,15 @@ fn describe_file(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn read_markdown_payload(path: PathBuf) -> Result<MarkdownFilePayload, String> {
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    Ok(MarkdownFilePayload {
+        file_name: describe_file(&path),
+        path: path.to_string_lossy().into_owned(),
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 fn describe_file_list(paths: &[PathBuf]) -> String {
@@ -519,6 +543,73 @@ fn hide_window(window: tauri::Window) {
     hide_main_window(&window.app_handle());
 }
 
+#[tauri::command]
+fn open_markdown_files() -> Result<Vec<MarkdownFilePayload>, String> {
+    let Some(paths) = rfd::FileDialog::new()
+        .add_filter("Markdown", &["md", "markdown", "mdown", "mkdn", "txt"])
+        .pick_files()
+    else {
+        return Ok(Vec::new());
+    };
+
+    paths.into_iter().map(read_markdown_payload).collect()
+}
+
+#[tauri::command]
+fn save_markdown_file(
+    existing_path: Option<String>,
+    suggested_name: String,
+    content: String,
+) -> Result<SavedMarkdownFile, String> {
+    let path = match existing_path {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => rfd::FileDialog::new()
+            .add_filter("Markdown", &["md", "markdown", "mdown", "mkdn", "txt"])
+            .set_file_name(&suggested_name)
+            .save_file()
+            .ok_or_else(|| "save canceled".to_string())?,
+    };
+
+    std::fs::write(&path, content).map_err(|error| error.to_string())?;
+
+    Ok(SavedMarkdownFile {
+        file_name: describe_file(&path),
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
+#[tauri::command]
+fn rename_markdown_file(existing_path: String, next_file_name: String) -> Result<SavedMarkdownFile, String> {
+    let trimmed = next_file_name.trim();
+    if trimmed.is_empty() {
+        return Err("file name is empty".to_string());
+    }
+
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("invalid file name".to_string());
+    }
+
+    let current_path = PathBuf::from(existing_path);
+    let parent = current_path
+        .parent()
+        .ok_or_else(|| "file has no parent directory".to_string())?;
+    let next_path = parent.join(trimmed);
+
+    if next_path == current_path {
+        return Ok(SavedMarkdownFile {
+            file_name: describe_file(&current_path),
+            path: current_path.to_string_lossy().into_owned(),
+        });
+    }
+
+    std::fs::rename(&current_path, &next_path).map_err(|error| error.to_string())?;
+
+    Ok(SavedMarkdownFile {
+        file_name: describe_file(&next_path),
+        path: next_path.to_string_lossy().into_owned(),
+    })
+}
+
 fn set_px(buf: &mut [u8], size: u32, x: i32, y: i32, color: [u8; 4]) {
     if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
         return;
@@ -630,7 +721,10 @@ pub fn run() {
             delete_item,
             toggle_pin,
             clear_history,
-            hide_window
+            hide_window,
+            open_markdown_files,
+            save_markdown_file,
+            rename_markdown_file
         ])
         .setup(|app| {
             let handle = app.handle().clone();

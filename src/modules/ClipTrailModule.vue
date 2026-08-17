@@ -1009,14 +1009,14 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  border: 1px solid #ececf1;
+  border: 1px solid var(--border);
   border-radius: 12px;
-  background: #ffffff;
-  color: #241d28;
+  background: var(--panel);
+  color: var(--text);
 }
 
 .scope-column.is-drop-target {
-  box-shadow: 0 0 0 2px #ececf1 inset;
+  box-shadow: 0 0 0 2px var(--border) inset;
 }
 
 .scope-column-head {
@@ -1024,8 +1024,8 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   padding: 10px 12px;
-  border-bottom: 1px solid #ececf1;
-  color: #74677a;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.4px;
@@ -1038,7 +1038,7 @@ onBeforeUnmount(() => {
 }
 
 .scope-column.is-drop-target .scope-column-head {
-  background: #f6f7fb;
+  background: var(--bg-elev);
 }
 
 .scope-column-list {
@@ -1048,41 +1048,35 @@ onBeforeUnmount(() => {
 }
 
 .list.split-layout .row:hover {
-  background: #f6f7fb;
+  background: var(--bg-elev);
 }
 
 .list.split-layout .row.active {
-  background: #ffffff;
-  border-color: #ececf1;
+  background: var(--panel);
+  border-color: var(--border);
   border-left-color: var(--accent);
 }
 
 .list.split-layout .content,
-.list.split-layout .file-name,
-.list.split-layout .act,
-.list.split-layout .file-path,
-.list.split-layout .meta,
-.list.split-layout .kind-tag,
-.list.split-layout .bit,
-.list.split-layout .image-caption {
-  color: #241d28;
+.list.split-layout .file-name {
+  color: var(--text);
 }
 
 .list.split-layout .act {
-  border-color: #ececf1;
+  border-color: var(--border);
 }
 
 .list.split-layout .file-line {
-  border-color: #ececf1;
-  background: #f6f7fb;
+  border-color: var(--border-soft);
+  background: var(--bg-elev);
 }
 
 .list.split-layout .kind-tag {
-  border-color: #ececf1;
+  border-color: var(--border);
 }
 
 .section-empty {
-  color: #74677a;
+  color: var(--text-dim);
   font-size: 11px;
   text-align: center;
   padding: 20px 8px;
